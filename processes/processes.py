@@ -176,7 +176,7 @@ class SRGan3DProcess:
                 r_preds, r_pred_position, r_patch_preds = discriminator_ddp(real_imgs)
             else:
                 r_preds, r_pred_position = discriminator_ddp(real_imgs)
-            
+
         if self.r1_lambda > 0 and discriminator_ddp.module.step % self.r1_interval == 0:
             # Gradient penalty
             if self.r1_patch:
@@ -234,8 +234,14 @@ class SRGan3DProcess:
                 position_penalty = nn.MSELoss()(g_pred_position, gen_positions) * self.pos_lambda
                 identity_penalty = position_penalty
 
-                cons_penalty = self.cons_lambda * ((bicubic_downsample(gen_imgs, generator_ddp.module.scale_factor) - lr_imgs)**2).mean()
-                cons_penalty += self.cons_lambda * ((bicubic_downsample(sr_rgba, generator_ddp.module.scale_factor) - lr_rgba)**2).mean()
+                if generator_ddp.module.scale_factor == 1.:
+                    cons_penalty = self.cons_lambda * ((gen_imgs - lr_imgs)**2).mean()
+                    cons_penalty += self.cons_lambda * ((sr_rgba - lr_rgba)**2).mean()
+                else:
+                    cons_penalty = self.cons_lambda * ((bicubic_downsample(gen_imgs, generator_ddp.module.scale_factor) - lr_imgs)**2).mean()
+                    cons_penalty += self.cons_lambda * ((bicubic_downsample(sr_rgba, generator_ddp.module.scale_factor) - lr_rgba)**2).mean()
+                # cons_penalty = self.cons_lambda * ((bicubic_downsample(gen_imgs, generator_ddp.module.scale_factor) - lr_imgs)**2).mean()
+                # cons_penalty += self.cons_lambda * ((bicubic_downsample(sr_rgba, generator_ddp.module.scale_factor) - lr_rgba)**2).mean()
               
                 patch_loss = 0
                 if self.use_patch_d:
@@ -273,8 +279,8 @@ class SRGan3DProcess:
                 sr_gen_imgs.append(imgs[0])
             gen_imgs = torch.cat(gen_imgs, dim=0)
             sr_gen_imgs = torch.cat(sr_gen_imgs, dim=0)
-            save_image(gen_imgs[:25], os.path.join(output_dir, "%06d_fixed.png"%discriminator_ddp.module.step), nrow=5, normalize=True, range=(-1, 1))
-            save_image(sr_gen_imgs[:25], os.path.join(output_dir, "%06d_fixed_sr.png"%discriminator_ddp.module.step), nrow=5, normalize=True, range=(-1, 1))
+            save_image(gen_imgs[:25], os.path.join(output_dir, "%06d_fixed.png"%discriminator_ddp.module.step), nrow=5, normalize=True, value_range=(-1, 1))
+            save_image(sr_gen_imgs[:25], os.path.join(output_dir, "%06d_fixed_sr.png"%discriminator_ddp.module.step), nrow=5, normalize=True, value_range=(-1, 1))
 
             gen_imgs = []
             sr_gen_imgs = []
@@ -284,5 +290,5 @@ class SRGan3DProcess:
                 sr_gen_imgs.append(imgs[0])
             gen_imgs = torch.cat(gen_imgs, dim=0)
             sr_gen_imgs = torch.cat(sr_gen_imgs, dim=0)
-            save_image(gen_imgs[:25], os.path.join(output_dir, "%06d_tilted.png"%discriminator_ddp.module.step), nrow=5, normalize=True, range=(-1, 1))
-            save_image(sr_gen_imgs[:25], os.path.join(output_dir, "%06d_tilted_sr.png"%discriminator_ddp.module.step), nrow=5, normalize=True, range=(-1, 1))
+            save_image(gen_imgs[:25], os.path.join(output_dir, "%06d_tilted.png"%discriminator_ddp.module.step), nrow=5, normalize=True, value_range=(-1, 1))
+            save_image(sr_gen_imgs[:25], os.path.join(output_dir, "%06d_tilted_sr.png"%discriminator_ddp.module.step), nrow=5, normalize=True, value_range=(-1, 1))

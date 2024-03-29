@@ -41,7 +41,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, default='GRAM64_FFHQ')
     parser.add_argument('--set_step', type=int, default=None, help='which step to load. None for latest')
     parser.add_argument('--total_step', type=int, default=100000, help='total training step')
-    parser.add_argument("--sample_interval", type=int, default=500, help="interval between image sampling")
+    parser.add_argument("--sample_interval", type=int, default=1000, help="interval between image sampling")
     parser.add_argument('--save_interval', type=int, default=5000, help='interval between model saving')
     parser.add_argument('--port', type=str, default='12345')
     opt = parser.parse_args()
@@ -59,7 +59,7 @@ if __name__ == '__main__':
             opt.set_step = None
     print('='*80)
     print('Config')
-    print('='*80)
+    print('='*80)   
     print(json.dumps(vars(opt), indent=4))
     num_gpus = len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))
     mp.spawn(train, args=(num_gpus, opt), nprocs=num_gpus, join=True)

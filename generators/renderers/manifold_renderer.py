@@ -120,6 +120,50 @@ def create_cam2world_matrix(forward_vector, origin, device=None):
 
     return cam2world
 
+### add
+def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
+    """
+    Sample @N_importance samples from @bins with distribution defined by @weights.
+    Inputs:
+        bins: (N_rays, N_samples_+1) where N_samples_ is "the number of coarse samples per ray - 2"
+        weights: (N_rays, N_samples_)
+        N_importance: the number of samples to draw from the distribution
+        det: deterministic or not
+        eps: a small number to prevent division by zero
+    Outputs:
+        samples: the sampled samples
+    Source: https://github.com/kwea123/nerf_pl/blob/master/models/rendering.py
+    """
+    N_rays, N_samples_ = weights.shape
+    weights = weights + eps # prevent division by zero (don't do inplace op!)
+    pdf = weights / torch.sum(weights, -1, keepdim=True) # (N_rays, N_samples_)
+    cdf = torch.cumsum(pdf, -1) # (N_rays, N_samples), cumulative distribution function
+    cdf = torch.cat([torch.zeros_like(cdf[: ,:1]), cdf], -1)  # (N_rays, N_samples_+1)
+                                                               # padded to 0~1 inclusive
+
+    if det:
+        u = torch.linspace(0, 1, N_importance, device=bins.device)
+        u = u.expand(N_rays, N_importance)
+    else:
+        u = torch.rand(N_rays, N_importance, device=bins.device)
+    u = u.contiguous()
+
+    inds = torch.searchsorted(cdf, u)
+    below = torch.clamp_min(inds-1, 0)
+    above = torch.clamp_max(inds, N_samples_)
+
+    inds_sampled = torch.stack([below, above], -1).view(N_rays, 2*N_importance)
+    cdf_g = torch.gather(cdf, 1, inds_sampled)
+    cdf_g = cdf_g.view(N_rays, N_importance, 2)
+    bins_g = torch.gather(bins, 1, inds_sampled).view(N_rays, N_importance, 2)
+
+    denom = cdf_g[...,1]-cdf_g[...,0]
+    denom[denom<eps] = 1 # denom equals 0 means a bin has weight 0, in which case it will not be sampled
+                         # anyway, therefore any value for it is fine (set to 1 here)
+
+    samples = bins_g[...,0] + (u-cdf_g[...,0])/denom * (bins_g[...,1]-bins_g[...,0])
+    return samples
+### 
 
 class ManifoldRenderer:
     """
@@ -147,37 +191,78 @@ class ManifoldRenderer:
         self.delta_final = delta_final
         self.lock_view_dependence = lock_view_dependence
     
-    def render(self, intersection, volume, img_size, camera_origin, camera_pos, fov, ray_start, ray_end, device):
+    def render(self, volume, img_size, camera_origin, camera_pos, fov, ray_start, ray_end, device, hierarchical_sample=True):
         B = camera_origin.shape[0]
         H = img_size
 
         with torch.no_grad():
             pts_sample, z_vals, rays_d = get_initial_rays(B, self.num_samples, resolution=(H, H), device=device, fov=fov, ray_start=ray_start, ray_end=ray_end, randomize=False)
-            pts_sample, rays_d, rays_o, _ = transform_sampled_points(pts_sample, rays_d, camera_origin, camera_pos, device=device)
+            pts_sample, rays_d_lr, rays_o, _ = transform_sampled_points(pts_sample, rays_d, camera_origin, camera_pos, device=device)
             pts_sample = pts_sample.reshape(B, H*H, -1, 3)
-            levels = torch.linspace(self.levels_start, self.levels_end, self.num_manifolds-1).to(device)
-            pts_bg, _ = get_intersection_with_MPI(rays_d, rays_o, device=device, mpi_start=-0.12, mpi_end=-0.12, mpi_num=1)
+            # levels = torch.linspace(self.levels_start, self.levels_end, self.num_manifolds-1).to(device)
+            pts_bg, _ = get_intersection_with_MPI(rays_d_lr, rays_o, device=device, mpi_start=-0.12, mpi_end=-0.12, mpi_num=1)
 
-        pts, _, is_valid = intersection(pts_sample, levels)
+        # pts, _, is_valid = intersection(pts_sample, levels)
+        is_valid = torch.ones(B, H*H, self.num_samples-1, 1).to(device)
+        pts = pts_sample[:, :, :-1, :]
         pts = torch.cat([pts, pts_bg],dim=-2)
         is_valid = torch.cat([is_valid,torch.ones(is_valid.shape[0],is_valid.shape[1],1,is_valid.shape[-1]).to(is_valid.device)],dim=-2)
 
         with torch.no_grad():
-            z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2, dim=-1, keepdim=True))
-            rays_d = rays_d.unsqueeze(-2).expand(-1,-1,self.num_manifolds,-1)
+            # z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2, dim=-1, keepdim=True))
+            rays_d = rays_d_lr.unsqueeze(-2).expand(-1,-1,self.num_samples,-1)
 
             if self.lock_view_dependence:
                 rays_d = torch.zeros_like(rays_d)
                 rays_d[..., -1] = -1
 
-        raw = volume(pts.reshape(B, -1, 3), rays_d.reshape(B, -1, 3)).reshape(B, H*H, self.num_manifolds, 4)
+        raw = volume(pts.reshape(B, -1, 3), rays_d.reshape(B, -1, 3)).reshape(B, H*H, self.num_samples, 4)
     
+        ### add
         _, indices = torch.sort(z_vals, dim=-2)
-        z_vals = torch.gather(z_vals, -2, indices)
-        raw = torch.gather(raw, -2, indices.expand(-1, -1, -1, 4))
-        is_valid = torch.gather(is_valid,-2,indices)
-
         bg_idx = torch.argmax(indices,dim=-2)
+        ### 
+        if hierarchical_sample:
+            with torch.no_grad():
+                _, _, weights, _ = fancy_integration(raw, z_vals, is_valid=is_valid, bg_idx=bg_idx, white_back=self.white_back, last_back=self.last_back, delta_final=self.delta_final, delta_alpha=self.delta_alpha)
+                weights = weights.reshape(B*H*H, self.num_samples) + 1e-5
+
+                # Start new importance sampling
+                z_vals = z_vals.reshape(B*H*H, self.num_samples)
+                z_vals_mid = 0.5 * (z_vals[:, :-1] + z_vals[:, 1:])
+                z_vals = z_vals.reshape(B, H*H, self.num_samples, 1)
+                fine_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], self.num_samples, det=False).detach()
+                fine_z_vals = fine_z_vals.reshape(B, H*H, self.num_samples, 1)
+                fine_pts = rays_o.unsqueeze(-2) + fine_z_vals.expand(-1,-1,-1,3) * rays_d_lr.unsqueeze(-2)
+                
+
+                if self.lock_view_dependence:
+                    rays_d = torch.zeros_like(rays_d)
+                    rays_d[..., -1] = -1
+            
+            fine_raw = volume(fine_pts.reshape(B, -1, 3), rays_d.reshape(B, -1, 3)).reshape(B, H*H, self.num_samples, -1)
+
+            all_raw = torch.cat([raw, fine_raw], dim=-2)
+            all_pts = torch.cat([pts, fine_pts], dim=-2)
+            z_vals = torch.sqrt(torch.sum((all_pts - rays_o[0, 0])**2, dim=-1, keepdim=True)) # [B, H*H, num_samples*2, 1]
+            is_valid = torch.ones_like(z_vals)
+
+            _, indices = torch.sort(z_vals, dim=-2)
+            z_vals = torch.gather(z_vals, -2, indices)
+            raw = torch.gather(all_raw, -2, indices.expand(-1, -1, -1, 4))
+
+
+            is_valid = torch.gather(is_valid, -2, indices)
+            bg_idx = torch.argmax(indices,dim=-2)
+        else:
+            z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2, dim=-1, keepdim=True)) # [B, H*H, num_samples, 1]
+            _, indices = torch.sort(z_vals, dim=-2)
+            z_vals = torch.gather(z_vals, -2, indices)
+            raw = torch.gather(raw, -2, indices.expand(-1, -1, -1, 4))
+
+            is_valid = torch.gather(is_valid, -2, indices)
+            bg_idx = torch.argmax(indices,dim=-2)                
+
 
         pixels, depth, _, _ = fancy_integration(raw, z_vals, is_valid=is_valid, bg_idx=bg_idx, white_back=self.white_back, last_back=self.last_back, delta_final=self.delta_final, delta_alpha=self.delta_alpha)
         pixels = pixels.reshape((B, H, H, 3))

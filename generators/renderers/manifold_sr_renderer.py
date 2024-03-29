@@ -158,6 +158,51 @@ def create_cam2world_matrix(forward_vector, origin, device=None):
     return cam2world
 
 
+### add
+def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
+    """
+    Sample @N_importance samples from @bins with distribution defined by @weights.
+    Inputs:
+        bins: (N_rays, N_samples_+1) where N_samples_ is "the number of coarse samples per ray - 2"
+        weights: (N_rays, N_samples_)
+        N_importance: the number of samples to draw from the distribution
+        det: deterministic or not
+        eps: a small number to prevent division by zero
+    Outputs:
+        samples: the sampled samples
+    Source: https://github.com/kwea123/nerf_pl/blob/master/models/rendering.py
+    """
+    N_rays, N_samples_ = weights.shape
+    weights = weights + eps # prevent division by zero (don't do inplace op!)
+    pdf = weights / torch.sum(weights, -1, keepdim=True) # (N_rays, N_samples_)
+    cdf = torch.cumsum(pdf, -1) # (N_rays, N_samples), cumulative distribution function
+    cdf = torch.cat([torch.zeros_like(cdf[: ,:1]), cdf], -1)  # (N_rays, N_samples_+1)
+                                                               # padded to 0~1 inclusive
+
+    if det:
+        u = torch.linspace(0, 1, N_importance, device=bins.device)
+        u = u.expand(N_rays, N_importance)
+    else:
+        u = torch.rand(N_rays, N_importance, device=bins.device)
+    u = u.contiguous()
+
+    inds = torch.searchsorted(cdf, u)
+    below = torch.clamp_min(inds-1, 0)
+    above = torch.clamp_max(inds, N_samples_)
+
+    inds_sampled = torch.stack([below, above], -1).view(N_rays, 2*N_importance)
+    cdf_g = torch.gather(cdf, 1, inds_sampled)
+    cdf_g = cdf_g.view(N_rays, N_importance, 2)
+    bins_g = torch.gather(bins, 1, inds_sampled).view(N_rays, N_importance, 2)
+
+    denom = cdf_g[...,1]-cdf_g[...,0]
+    denom[denom<eps] = 1 # denom equals 0 means a bin has weight 0, in which case it will not be sampled
+                         # anyway, therefore any value for it is fine (set to 1 here)
+
+    samples = bins_g[...,0] + (u-cdf_g[...,0])/denom * (bins_g[...,1]-bins_g[...,0])
+    return samples
+### 
+
 def bg_map(x):
     return  (x < -0.5) * (0.24 * torch.tan(x + 0.5) - 0.12) + \
             (x >= -0.5) * (x <= 0.5) * (0.24 * x) + \
@@ -168,6 +213,7 @@ def bg_invmap(x):
     return  (x < -0.12) * (torch.atan((x + 0.12) / 0.24) - 0.5) + \
             (x >= -0.12) * (x <= 0.12) * (x / 0.24) + \
             (x > 0.12) * (torch.atan((x - 0.12) / 0.24) + 0.5)
+
 
 
 class ManifoldSRRenderer:
@@ -198,38 +244,80 @@ class ManifoldSRRenderer:
         self.lock_view_dependence = lock_view_dependence
         self.scale_factor = scale_factor
     
-    def render(self, intersection, volume, feature, sr_model, sr_model_bg, img_size, camera_origin, camera_pos, fov, ray_start, ray_end, device):
+    def render(self, volume, feature, sr_model, sr_model_bg, img_size, camera_origin, camera_pos, fov, ray_start, ray_end, device, hierarchical_sample=True):
         B = camera_origin.shape[0]
         H = img_size
         HL = H // self.scale_factor
 
         ### Render low-res image ###
         with torch.no_grad():
-            pts_sample, _, rays_d = get_initial_rays(B, self.num_samples, resolution=(HL, HL), device=device, fov=fov, ray_start=ray_start, ray_end=ray_end, randomize=False) # [B, HL*HL, num_samples, 3], [B, HL*HL, num_samples], [B, HL*HL, 3]
-            pts_sample, rays_d, rays_o, _ = transform_sampled_points(pts_sample, rays_d, camera_origin, camera_pos, device=device) # [B, HL*HL, num_samples, 3], [B, HL*HL, 3], [B, HL*HL, 3], [B, 3]
+            pts_sample, z_vals, rays_d = get_initial_rays(B, self.num_samples, resolution=(HL, HL), device=device, fov=fov, ray_start=ray_start, ray_end=ray_end, randomize=False) # [B, HL*HL, num_samples, 3], [B, HL*HL, num_samples], [B, HL*HL, 3]
+            pts_sample, rays_d_lr, rays_o, _ = transform_sampled_points(pts_sample, rays_d, camera_origin, camera_pos, device=device) # [B, HL*HL, num_samples, 3], [B, HL*HL, 3], [B, HL*HL, 3], [B, 3]
             pts_sample = pts_sample.reshape(B, HL*HL, -1, 3) # [B, HL*HL, num_samples, 3]
             
-            levels = torch.linspace(self.levels_start, self.levels_end, self.num_manifolds-1).to(device)
-            pts_bg, _ = get_intersection_with_MPI(rays_d, rays_o, device=device, mpi_start=-0.12, mpi_end=-0.12, mpi_num=1) # [B, HL*HL, 1, 3], [B, HL*HL, 1, 1]
-            pts, _, is_valid = intersection(pts_sample, levels) # [B, HL*HL, num_manifolds-1, 3], [B, HL*HL, num_manifolds-1, 1], [B, HL*HL, num_manifolds-1, 1]
-            lr_is_valid, lr_pts, lr_pts_bg = is_valid, pts, pts_bg
+            # levels = torch.linspace(self.levels_start, self.levels_end, self.num_manifolds-1).to(device)
+            pts_bg, _ = get_intersection_with_MPI(rays_d_lr, rays_o, device=device, mpi_start=-0.12, mpi_end=-0.12, mpi_num=1) # [B, HL*HL, 1, 3], [B, HL*HL, 1, 1]
+            # pts, _, is_valid = intersection(pts_sample, levels) # [B, HL*HL, num_manifolds-1, 3], [B, HL*HL, num_manifolds-1, 1], [B, HL*HL, num_manifolds-1, 1]
+            is_valid = torch.ones(B, HL*HL, self.num_samples, 1, device=device)
+            pts = pts_sample[:, :, :-1, :]    # [B, HL*HL, num_samples, 3]
+            lr_is_valid, lr_pts, lr_pts_bg = is_valid[:, :, :-1, :], pts, pts_bg
 
             pts = torch.cat([pts, pts_bg], dim=-2) # [B, HL*HL, num_manifolds, 3]
-            rays_d = rays_d.unsqueeze(-2).expand(-1,-1,self.num_manifolds,-1) # [B, HL*HL, num_manifolds, 3]
-            is_valid = torch.cat([is_valid,torch.ones(is_valid.shape[0],is_valid.shape[1],1,is_valid.shape[-1]).to(is_valid.device)],dim=-2) # [B, HL*HL, num_manifolds, 1]
-            z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2, dim=-1, keepdim=True)) # [B, HL*HL, num_manifolds, 1]
+            rays_d = rays_d_lr.unsqueeze(-2).expand(-1,-1,self.num_samples,-1) # [B, HL*HL, num_manifolds, 3]
+
+            
+            # is_valid = torch.cat([is_valid,torch.ones(is_valid.shape[0],is_valid.shape[1],1,is_valid.shape[-1]).to(is_valid.device)],dim=-2) # [B, HL*HL, num_manifolds, 1]
+            # z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2, dim=-1, keepdim=True)) # [B, HL*HL, num_manifolds, 1]
 
             if self.lock_view_dependence:
                 rays_d = torch.zeros_like(rays_d)
                 rays_d[..., -1] = -1
 
-            raw = volume(pts.reshape(B, -1, 3), rays_d.reshape(B, -1, 3)).reshape(B, HL*HL, self.num_manifolds, -1) # [B, HL*HL, num_manifolds, 4]
+            # [rgb, sigma]
+            raw = volume(pts.reshape(B, -1, 3), rays_d.reshape(B, -1, 3)).reshape(B, HL*HL, self.num_samples, -1) # [B, HL*HL, num_manifolds, 4]
 
+            ### add
             _, indices = torch.sort(z_vals, dim=-2)
-            z_vals = torch.gather(z_vals, -2, indices)
-            raw = torch.gather(raw, -2, indices.expand(-1, -1, -1, 4))
-            is_valid = torch.gather(is_valid, -2, indices)
             bg_idx = torch.argmax(indices,dim=-2)
+            ###
+            if hierarchical_sample:
+                with torch.no_grad():
+                    _, _, weights, _ = fancy_integration(raw, z_vals, is_valid=is_valid, bg_idx=bg_idx, white_back=self.white_back, last_back=self.last_back, delta_final=self.delta_final, delta_alpha=self.delta_alpha)
+                    weights = weights.reshape(B*HL*HL, self.num_samples) + 1e-5
+
+                    # Start new importance sampling
+                    z_vals = z_vals.reshape(B*HL*HL, self.num_samples)
+                    z_vals_mid = 0.5 * (z_vals[:, :-1] + z_vals[:, 1:])
+                    z_vals = z_vals.reshape(B, HL*HL, self.num_samples, 1)
+                    fine_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], self.num_samples, det=False).detach()
+                    fine_z_vals = fine_z_vals.reshape(B, HL*HL, self.num_samples, 1)
+                    fine_pts = rays_o.unsqueeze(-2) + fine_z_vals.expand(-1,-1,-1,3) * rays_d_lr.unsqueeze(-2)
+
+                    if self.lock_view_dependence:
+                        rays_d = torch.zeros_like(rays_d)
+                        rays_d[..., -1] = -1
+                
+                fine_raw = volume(fine_pts.reshape(B, -1, 3), rays_d.reshape(B, -1, 3)).reshape(B, HL*HL, self.num_samples, -1)
+
+                all_raw = torch.cat([raw, fine_raw], dim=-2)
+                all_pts = torch.cat([pts, fine_pts], dim=-2)
+                z_vals = torch.sqrt(torch.sum((all_pts - rays_o[0, 0])**2, dim=-1, keepdim=True)) # [B, HL*HL, num_samples*2, 1]
+                is_valid = torch.ones_like(z_vals)
+
+                _, indices = torch.sort(z_vals, dim=-2)
+                z_vals = torch.gather(z_vals, -2, indices)
+                raw = torch.gather(all_raw, -2, indices.expand(-1, -1, -1, 4))
+
+                is_valid = torch.gather(is_valid, -2, indices)
+                bg_idx = torch.argmax(indices,dim=-2)
+            else:
+                z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2, dim=-1, keepdim=True)) # [B, HL*HL, num_samples, 1]
+                _, indices = torch.sort(z_vals, dim=-2)
+                z_vals = torch.gather(z_vals, -2, indices)
+                raw = torch.gather(raw, -2, indices.expand(-1, -1, -1, 4))
+
+                is_valid = torch.gather(is_valid, -2, indices)
+                bg_idx = torch.argmax(indices,dim=-2)
 
             lr_pixels, lr_depth, _, _ = fancy_integration(raw, z_vals, is_valid=is_valid, bg_idx=bg_idx, white_back=self.white_back, last_back=self.last_back, delta_final=self.delta_final, delta_alpha=self.delta_alpha)
             lr_pixels = lr_pixels.reshape(B, HL, HL, 3)
@@ -239,16 +327,20 @@ class ManifoldSRRenderer:
         ### Super Resolution ###
         # Gridding
         with torch.no_grad():
+            # 前景
             y, x = torch.meshgrid(torch.linspace(-fov/100, fov/100, HL), torch.linspace(-fov/100, fov/100, HL), indexing='ij')
             grid_ray_o = torch.stack([x.reshape(-1), y.reshape(-1), torch.ones(HL*HL)], dim=-1).expand(B, -1, -1).to(device) # [B, HL*HL, 3]
             grid_ray_d = torch.tensor([0, 0, -1], device=device).expand(B, HL*HL, -1) # [B, HL*HL, 3]
             grid_pts_sample = grid_ray_o.unsqueeze(-2) + torch.linspace(ray_start, ray_end, self.num_samples, device=device).unsqueeze(-1) * grid_ray_d.unsqueeze(-2) # [B, HL*HL, num_samples, 3]
             grid_pts_sample = grid_pts_sample.reshape(B, HL*HL, -1, 3) # [B, HL*HL, num_samples, 3]
 
-            levels = torch.linspace(self.levels_start, self.levels_end, self.num_manifolds-1).to(device)
-            grid_pts,_,is_valid = intersection(grid_pts_sample, levels) # [B, HL*HL, num_manifolds-1, 3], [B, HL*HL, num_manifolds-1, 1], [B, HL*HL, num_manifolds-1, 1]
+    
+            # levels = torch.linspace(self.levels_start, self.levels_end, self.num_manifolds-1).to(device)
+            # grid_pts,_,is_valid = intersection(grid_pts_sample, levels) # [B, HL*HL, num_manifolds-1, 3], [B, HL*HL, num_manifolds-1, 1], [B, HL*HL, num_manifolds-1, 1]
+            grid_pts, is_valid = grid_pts_sample[:, :, :-1, :], torch.ones(B, HL*HL, self.num_samples-1, 1, device=device)
             grid_ray_d = normalize_vecs(grid_pts - rays_o[0, 0]) # [B, HL*HL, num_manifolds-1, 3]
 
+            # 背景
             y, x = torch.meshgrid(torch.linspace(-1, 1, HL), torch.linspace(-1, 1, HL), indexing='ij')
             grid_pts_bg = torch.stack([bg_map(x).reshape(-1), bg_map(y).reshape(-1), -0.12*torch.ones(HL*HL)], dim=-1).expand(B, -1, -1).to(device)
             grid_pts_bg = grid_pts_bg.reshape(B, HL*HL, 3) # [B, HL*HL, 3]
@@ -261,14 +353,14 @@ class ManifoldSRRenderer:
                 grid_ray_d_bg[..., -1] = -1
         
         raw, feature = feature(grid_pts.reshape(B, -1, 3), grid_ray_d.reshape(B, -1, 3))
-        raw = raw.reshape(B, HL*HL, self.num_manifolds-1, 4) # [B, HL*HL, num_manifolds-1, 4]
-        feature = feature.reshape(B, HL*HL, self.num_manifolds-1, -1) # [B, HL*HL, num_manifolds-1, feature_dim]
+        raw = raw.reshape(B, HL*HL, self.num_samples-1, 4) # [B, HL*HL, num_manifolds-1, 4]
+        feature = feature.reshape(B, HL*HL, self.num_samples-1, -1) # [B, HL*HL, num_manifolds-1, feature_dim]
         raw_bg = volume(grid_pts_bg.reshape(B, -1, 3), grid_ray_d_bg.reshape(B, -1, 3)).reshape(B, HL*HL, 1, 4) # [B, HL*HL, 1, 4]
 
         raw[..., 3:] = calculate_alpha(raw, is_valid)
         feature = torch.cat([raw, feature], dim=-1) # [B, HL*HL, num_manifolds-1, 4+feature_dim]
-        lr_features = feature.permute(0, 2, 3, 1).reshape(B*(self.num_manifolds-1), -1, HL, HL) # [B*(num_manifolds-1), 4+feature_dim, HL, HL]
-        lr_raw = raw.permute(0, 2, 3, 1).reshape(B*(self.num_manifolds-1), 4, HL, HL) # [B*(num_manifolds-1), 4, HL, HL]
+        lr_features = feature.permute(0, 2, 3, 1).reshape(B*(self.num_samples-1), -1, HL, HL) # [B*(num_manifolds-1), 4+feature_dim, HL, HL]
+        lr_raw = raw.permute(0, 2, 3, 1).reshape(B*(self.num_samples-1), 4, HL, HL) # [B*(num_manifolds-1), 4, HL, HL]
         lr_raw_bg = raw_bg.permute(0, 2, 3, 1).reshape(B, 4, HL, HL)[:, :3, :, :] # [B, 3, HL, HL]
 
         # SR manifolds
@@ -282,26 +374,28 @@ class ManifoldSRRenderer:
 
         # Rendering
         with torch.no_grad():
-            pts = F.interpolate(lr_pts.permute(0, 2, 3, 1).reshape(B*(self.num_manifolds-1), 3, HL, HL), scale_factor=self.scale_factor, mode='bilinear', align_corners=True) \
-                .reshape(B, self.num_manifolds-1, 3, H*H) \
+            # 上采样 提高分辨率
+            pts = F.interpolate(lr_pts.permute(0, 2, 3, 1).reshape(B*(self.num_samples-1), 3, HL, HL), scale_factor=self.scale_factor, mode='bilinear', align_corners=True) \
+                .reshape(B, self.num_samples-1, 3, H*H) \
                 .permute(0, 3, 1, 2) \
-                .reshape(B, H*H, self.num_manifolds-1, 3) # [B, H*H, num_manifolds-1, 3]
+                .reshape(B, H*H, self.num_samples-1, 3) # [B, H*H, num_manifolds-1, 3]
 
-            is_valid = (F.interpolate(lr_is_valid.permute(0, 2, 3, 1).reshape(B*(self.num_manifolds-1), 1, HL, HL), scale_factor=self.scale_factor, mode='bilinear', align_corners=True) > 0.99) \
-                .reshape(B, self.num_manifolds-1, 1, H*H) \
+            is_valid = (F.interpolate(lr_is_valid.permute(0, 2, 3, 1).reshape(B*(self.num_samples-1), 1, HL, HL), scale_factor=self.scale_factor, mode='bilinear', align_corners=True) > 0.99) \
+                .reshape(B, self.num_samples-1, 1, H*H) \
                 .permute(0, 3, 1, 2) \
-                .reshape(B, H*H, self.num_manifolds-1, 1).to(pts.dtype) # [B, H*H, num_manifolds-1, 1]
+                .reshape(B, H*H, self.num_samples-1, 1).to(pts.dtype) # [B, H*H, num_manifolds-1, 1]
             is_valid = torch.cat([is_valid,torch.ones(is_valid.shape[0],is_valid.shape[1],1,is_valid.shape[-1]).to(is_valid.device)],dim=-2) # [B, H*H, num_manifolds, 1]
 
             pts_bg = F.interpolate(lr_pts_bg.squeeze(-2).permute(0, 2, 1).reshape(B, 3, HL, HL), scale_factor=self.scale_factor, mode='bilinear', align_corners=True) \
                 .reshape(B, 3, H*H) \
                 .permute(0, 2, 1) \
                 .reshape(B, H*H, 1, 3) # [B, H*H, 1, 3]
-
+        
+        # 网格填充 [rgb sigma]
         raw_bg = F.grid_sample(hr_raw_bg.float(), bg_invmap(pts_bg[..., :2].float()).permute(0, 2, 1, 3).reshape(B, H, H, 2), mode='bilinear', padding_mode='reflection', align_corners=False).reshape(B, 1, 4, H*H).permute(0, 3, 1, 2) # [B, H*H, 1, 4]
-        raw = F.grid_sample(hr_raw.float(), pts[..., :2].float().permute(0, 2, 1, 3).reshape(B*(self.num_manifolds-1), H, H, 2) / fov * 100, mode='bilinear', padding_mode='zeros', align_corners=False).reshape(B, self.num_manifolds-1, 4, H*H).permute(0, 3, 1, 2) # [B, H*H, num_manifolds-1, 4]
+        raw = F.grid_sample(hr_raw.float(), pts[..., :2].float().permute(0, 2, 1, 3).reshape(B*(self.num_samples-1), H, H, 2) / fov * 100, mode='bilinear', padding_mode='zeros', align_corners=False).reshape(B, self.num_samples-1, 4, H*H).permute(0, 3, 1, 2) # [B, H*H, num_manifolds-1, 4]
         raw = torch.cat([raw, raw_bg], dim=-2) # [B, H*H, num_manifolds, 4]
-        pts = torch.cat([pts, pts_bg],dim=-2).reshape(B, H*H, self.num_manifolds, 3) # [B, H*H, num_manifolds, 3]
+        pts = torch.cat([pts, pts_bg],dim=-2).reshape(B, H*H, self.num_samples, 3) # [B, H*H, num_manifolds, 3]
         z_vals = torch.sqrt(torch.sum((pts - rays_o[0, 0])**2,dim=-1,keepdim=True)) # [B, H*H, num_manifolds, 1]
 
         _, indices = torch.sort(z_vals, dim=-2)
@@ -322,5 +416,10 @@ class ManifoldSRRenderer:
             'hr_depth': hr_depth.reshape(B, H, H, 1),
             'features': lr_features
         }
-
+        
+        # print("hr_pixels shape: ", hr_pixels.shape)
+        # print("lr_pixels shape: ", lr_pixels.shape)
+        # print("hr_raw shape: ", hr_raw.shape)
+        # print("lr_raw shape: ", lr_raw.shape)
+        
         return (hr_pixels, lr_pixels, hr_raw, lr_raw), detail

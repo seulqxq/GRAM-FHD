@@ -109,82 +109,82 @@ class UniformBoxWarp(nn.Module):
         return coordinates * self.scale_factor
 
 
-class GramSample(nn.Module):
-    def __init__(self, hidden_dim_sample=64, layer_num_sample=3, center=(0,0,0), init_radius=0):
-        super().__init__()
-        self.hidden_dim = hidden_dim_sample
-        self.layer_num = layer_num_sample
+# class GramSample(nn.Module):
+#     def __init__(self, hidden_dim_sample=64, layer_num_sample=3, center=(0,0,0), init_radius=0):
+#         super().__init__()
+#         self.hidden_dim = hidden_dim_sample
+#         self.layer_num = layer_num_sample
 
-        self.network = [nn.Linear(3, self.hidden_dim), nn.ReLU(inplace=True)]
-        for _ in range(self.layer_num - 1):
-            self.network += [nn.Linear(self.hidden_dim, self.hidden_dim), nn.ReLU(inplace=True)]
+#         self.network = [nn.Linear(3, self.hidden_dim), nn.ReLU(inplace=True)]
+#         for _ in range(self.layer_num - 1):
+#             self.network += [nn.Linear(self.hidden_dim, self.hidden_dim), nn.ReLU(inplace=True)]
         
-        self.network = nn.Sequential(*self.network)
+#         self.network = nn.Sequential(*self.network)
 
-        self.output_layer = nn.Linear(self.hidden_dim, 1)
+#         self.output_layer = nn.Linear(self.hidden_dim, 1)
 
-        self.network.apply(geometry_init)
-        self.output_layer.apply(geometry_init_last_layer(init_radius))
-        self.center = torch.tensor(center)
+#         self.network.apply(geometry_init)
+#         self.output_layer.apply(geometry_init_last_layer(init_radius))
+#         self.center = torch.tensor(center)
         
-        self.gridwarper = UniformBoxWarp(0.24) # Don't worry about this, it was added to ensure compatibility with another model. Shouldn't affect performance.
+#         self.gridwarper = UniformBoxWarp(0.24) # Don't worry about this, it was added to ensure compatibility with another model. Shouldn't affect performance.
 
-    def calculate_intersection(self,intervals,vals,levels):
-        intersections = []
-        is_valid = []
-        for interval,val,l in zip(intervals,vals,levels):
-            x_l = interval[:,:,0]
-            x_h = interval[:,:,1]
-            s_l = val[:,:,0]
-            s_h = val[:,:,1]
-            scale = torch.where(torch.abs(s_h-s_l) > 0.05,s_h-s_l,torch.ones_like(s_h)*0.05)
-            intersect = torch.where(((s_h-l<=0)*(l-s_l<=0)) & (torch.abs(s_h-s_l) > 0.05),((s_h-l)*x_l + (l-s_l)*x_h)/scale,x_h)
-            intersections.append(intersect)
-            is_valid.append(((s_h-l<=0)*(l-s_l<=0)).to(intersect.dtype))
+#     def calculate_intersection(self,intervals,vals,levels):
+#         intersections = []
+#         is_valid = []
+#         for interval,val,l in zip(intervals,vals,levels):
+#             x_l = interval[:,:,0]
+#             x_h = interval[:,:,1]
+#             s_l = val[:,:,0]
+#             s_h = val[:,:,1]
+#             scale = torch.where(torch.abs(s_h-s_l) > 0.05,s_h-s_l,torch.ones_like(s_h)*0.05)
+#             intersect = torch.where(((s_h-l<=0)*(l-s_l<=0)) & (torch.abs(s_h-s_l) > 0.05),((s_h-l)*x_l + (l-s_l)*x_h)/scale,x_h)
+#             intersections.append(intersect)
+#             is_valid.append(((s_h-l<=0)*(l-s_l<=0)).to(intersect.dtype))
         
-        return torch.stack(intersections,dim=-2),torch.stack(is_valid,dim=-2) #[batch,N_rays,level,3]
+#         return torch.stack(intersections,dim=-2),torch.stack(is_valid,dim=-2) #[batch,N_rays,level,3]
     
-    def forward(self,input):
-        x = input
-        x = self.gridwarper(x)
-        x = x - self.center.to(x.device)
-        x = self.network(x)
-        s = self.output_layer(x)
+#     def forward(self,input):
+#         x = input
+#         x = self.gridwarper(x)
+#         x = x - self.center.to(x.device)
+#         x = self.network(x)
+#         s = self.output_layer(x)
 
-        return s
+#         return s
 
-    def get_intersections(self, input, levels, **kwargs):
-        # levels num_l
-        batch,N_rays,N_points,_ = input.shape
+#     def get_intersections(self, input, levels, **kwargs):
+#         # levels num_l
+#         batch,N_rays,N_points,_ = input.shape
         
-        x = input.reshape(batch,-1,3)
-        x = self.gridwarper(x)
+#         x = input.reshape(batch,-1,3)
+#         x = self.gridwarper(x)
 
-        x = x - self.center.to(x.device)
+#         x = x - self.center.to(x.device)
 
-        x = self.network(x)
-        s = self.output_layer(x)
+#         x = self.network(x)
+#         s = self.output_layer(x)
 
-        s = s.reshape(batch,N_rays,N_points,1)
-        s_l = s[:,:,:-1]
-        s_h = s[:,:,1:]
+#         s = s.reshape(batch,N_rays,N_points,1)
+#         s_l = s[:,:,:-1]
+#         s_h = s[:,:,1:]
 
-        cost = torch.linspace(N_points-1,0,N_points-1).float().to(input.device).reshape(1,1,-1,1)
-        x_interval = []
-        s_interval = []
-        for l in levels:
-            r = (s_h-l <= 0) * (l-s_l <= 0) * 2 - 1
-            r = r*cost
-            _, indices = torch.max(r,dim=-2,keepdim=True)
-            x_l_select = torch.gather(input,-2,indices.expand(-1, -1, -1, 3)) # [batch,N_rays,1]
-            x_h_select = torch.gather(input,-2,indices.expand(-1, -1, -1, 3)+1) # [batch,N_rays,1]
-            s_l_select = torch.gather(s_l,-2,indices)
-            s_h_select = torch.gather(s_h,-2,indices)
-            x_interval.append(torch.cat([x_l_select,x_h_select],dim=-2))
-            s_interval.append(torch.cat([s_l_select,s_h_select],dim=-2))
+#         cost = torch.linspace(N_points-1,0,N_points-1).float().to(input.device).reshape(1,1,-1,1)
+#         x_interval = []
+#         s_interval = []
+#         for l in levels:
+#             r = (s_h-l <= 0) * (l-s_l <= 0) * 2 - 1
+#             r = r*cost
+#             _, indices = torch.max(r,dim=-2,keepdim=True)
+#             x_l_select = torch.gather(input,-2,indices.expand(-1, -1, -1, 3)) # [batch,N_rays,1]
+#             x_h_select = torch.gather(input,-2,indices.expand(-1, -1, -1, 3)+1) # [batch,N_rays,1]
+#             s_l_select = torch.gather(s_l,-2,indices)
+#             s_h_select = torch.gather(s_h,-2,indices)
+#             x_interval.append(torch.cat([x_l_select,x_h_select],dim=-2))
+#             s_interval.append(torch.cat([s_l_select,s_h_select],dim=-2))
         
-        intersections,is_valid = self.calculate_intersection(x_interval,s_interval,levels)        
-        return intersections,s,is_valid
+#         intersections,is_valid = self.calculate_intersection(x_interval,s_interval,levels)        
+#         return intersections,s,is_valid
 
 
 class GramRF(nn.Module):
@@ -349,14 +349,14 @@ class GramRF(nn.Module):
 class Gram(nn.Module):
     def __init__(self, z_dim=256, feature_dim=0, hidden_dim=256, sigma_clamp_mode='softplus', rgb_clamp_mode='widen_sigmoid', **sample_network_kwargs):
         super().__init__()
-        self.sample_network = GramSample(**sample_network_kwargs)
+        # self.sample_network = GramSample(**sample_network_kwargs)
         self.rf_network = GramRF(z_dim, feature_dim, hidden_dim, sigma_clamp_mode, rgb_clamp_mode)
 
     def get_avg_w(self):
         return self.rf_network.get_avg_w()
 
-    def get_intersections(self, points, levels):
-        return self.sample_network.get_intersections(points, levels)
+    # def get_intersections(self, points, levels):
+    #     return self.sample_network.get_intersections(points, levels)
 
     def get_radiance(self, z, x, ray_directions, truncation_psi=1):
         return self.rf_network(x, z, ray_directions, truncation_psi)
