@@ -17,6 +17,11 @@ from processes import processes
 import configs as configs
 import datasets
 
+import fid_evaluation
+from torchvision.utils import save_image
+from torch.utils.tensorboard import SummaryWriter
+
+from torch_ema import ExponentialMovingAverage
 
 def set_generator(config, device, opt):
     generator_args = {}
@@ -109,6 +114,11 @@ def training_process(rank, world_size, opt, device):
     if config['global'].get('disable_scaler', False):
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
+#--------------------------------------------------------------------------------------    
+# initialize logger if rank is 0
+    if rank == 0:
+        logger = SummaryWriter(os.path.join(opt.output_dir, 'logs'))
+
 #--------------------------------------------------------------------------------------
 #set generator and discriminator
     generator, ema, ema2 = set_generator(config, device, opt)
@@ -173,11 +183,27 @@ def training_process(rank, world_size, opt, device):
         f.write('\n\n')
         f.write(str(config))
 
-    with tqdm(desc="Steps", total=opt.total_step, initial=generator.step, disable=(rank!=0)) as pbar:
-        while True:             
+    for _ in range (opt.total_step):    
+        with tqdm(desc="Steps", total=opt.total_step, initial=generator.step, disable=(rank!=0)) as pbar:
+        # while True:         
             #--------------------------------------------------------------------------------------
             # trainging iterations
             for i, (imgs, poses) in enumerate(dataloader):
+                # save model
+                if discriminator.step % opt.save_interval == 0 and rank == 0:
+                    torch.save(ema, os.path.join(opt.output_dir, 'step%06d_ema.pth'%discriminator.step))
+                    torch.save(ema2, os.path.join(opt.output_dir, 'step%06d_ema2.pth'%discriminator.step))
+                    torch.save(generator_ddp.module.state_dict(), os.path.join(opt.output_dir, 'step%06d_generator.pth'%discriminator.step))
+                    torch.save(discriminator_ddp.module.state_dict(), os.path.join(opt.output_dir, 'step%06d_discriminator.pth'%discriminator.step))
+                    torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, 'step%06d_optimizer_G.pth'%discriminator.step))
+                    torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, 'step%06d_optimizer_D.pth'%discriminator.step))
+                    torch.save(scaler.state_dict(), os.path.join(opt.output_dir, 'step%06d_scaler.pth'%discriminator.step))
+                    torch.cuda.empty_cache()
+                dist.barrier()                       
+            #--------------------------------------------------------------------------------------
+
+                if dataloader.batch_size != config['global']['batch_size']: break
+
                 if scaler.get_scale() < 1:
                     scaler.update(1.)
 
@@ -188,10 +214,28 @@ def training_process(rank, world_size, opt, device):
                 # TRAIN DISCRIMINATOR
                 d_loss = process.train_D(real_imgs, real_poses, generator_ddp, discriminator_ddp, optimizer_D, scaler, config, device)
                 discriminator_losses.append(d_loss)
+                
+                # if rank == 0:
+                #     logger.add_scalar('d_loss', d_loss, discriminator.step)
+                if rank == 0:
+                    logger.add_scalar('d_loss Total', d_loss['Total'], discriminator.step)
+                    logger.add_scalar('d_loss Main', d_loss['Main'], discriminator.step)
+                    logger.add_scalar('d_loss Patch', d_loss['Patch'], discriminator.step)
+                    logger.add_scalar('d_loss R1', d_loss['R1'], discriminator.step)
+                    logger.add_scalar('d_loss Pos', d_loss['Pos'], discriminator.step)
 
                 # TRAIN GENERATOR
                 g_loss = process.train_G(real_imgs, generator_ddp, ema, ema2, discriminator_ddp, optimizer_G, scaler, config, device)
                 generator_losses.append(g_loss)
+
+                # if rank == 0:
+                #     logger.add_scalar('g_loss', g_loss, generator.step)
+                if rank == 0:
+                    logger.add_scalar('g_loss Total', g_loss['Total'], generator.step)
+                    logger.add_scalar('g_loss Main', g_loss['Main'], generator.step)
+                    logger.add_scalar('g_loss Patch', g_loss['Patch'], generator.step)
+                    logger.add_scalar('g_loss Cons', g_loss['Cons'], generator.step)
+                    logger.add_scalar('g_loss Pos', g_loss['Pos'], generator.step)
 
                 pbar.update(1)
                 discriminator.step += 1
@@ -201,21 +245,48 @@ def training_process(rank, world_size, opt, device):
                 # print and save
                 if rank == 0:
                     if i%10 == 0:
-                        tqdm.write(f"[Experiment: {opt.output_dir}] [GPU: {os.environ['CUDA_VISIBLE_DEVICES']}] [Step: {discriminator.step}] [D loss: {d_loss}] [G loss: {g_loss}] [Scale: {scaler.get_scale()}]")
+                        tqdm.write(f"[Experiment: {opt.output_dir}] [GPU: {os.environ['CUDA_VISIBLE_DEVICES']}] [Step: {discriminator.step}] [D loss: {d_loss['Total']:.10f}] [PD loss: {d_loss['Patch']:.10f}] [G loss: {g_loss['Total']:.10f}] [PG loss: {g_loss['Patch']:.10f}] [Scale: {scaler.get_scale()}]")
+                        # tqdm.write(f"[Experiment: {opt.output_dir}] [GPU: {os.environ['CUDA_VISIBLE_DEVICES']}] [Step: {discriminator.step}] [D loss: {d_loss:.10f}] [G loss: {g_loss:.10f}] [Scale: {scaler.get_scale()}]")
 
                     # save fixed angle generated images
                     if discriminator.step % opt.sample_interval == 0:
                         process.snapshot(generator_ddp, discriminator_ddp, config, opt.output_dir, device)
 
-                    # save_model
-                    if discriminator.step % opt.save_interval == 0:
-                        torch.save(ema, os.path.join(opt.output_dir, 'step%06d_ema.pth'%discriminator.step))
-                        torch.save(ema2, os.path.join(opt.output_dir, 'step%06d_ema2.pth'%discriminator.step))
-                        torch.save(generator_ddp.module.state_dict(), os.path.join(opt.output_dir, 'step%06d_generator.pth'%discriminator.step))
-                        torch.save(discriminator_ddp.module.state_dict(), os.path.join(opt.output_dir, 'step%06d_discriminator.pth'%discriminator.step))
-                        torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, 'step%06d_optimizer_G.pth'%discriminator.step))
-                        torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, 'step%06d_optimizer_D.pth'%discriminator.step))
-                        torch.save(scaler.state_dict(), os.path.join(opt.output_dir, 'step%06d_scaler.pth'%discriminator.step))
+                    # save model
+                    if discriminator.step % opt.sample_interval == 0:
+                        torch.save(ema, os.path.join(opt.output_dir, 'ema.pth'))
+                        torch.save(ema2, os.path.join(opt.output_dir, 'ema2.pth'))
+                        torch.save(generator_ddp.module.state_dict(), os.path.join(opt.output_dir, 'generator.pth'))
+                        torch.save(discriminator_ddp.module.state_dict(), os.path.join(opt.output_dir, 'discriminator.pth'))
+                        torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, 'optimizer_G.pth'))
+                        torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, 'optimizer_D.pth'))
+                        torch.save(scaler.state_dict(), os.path.join(opt.output_dir, 'scaler.pth'))
                         torch.save(generator_losses, os.path.join(opt.output_dir, 'generator.losses'))
-                        torch.save(discriminator_losses, os.path.join(opt.output_dir, 'discriminator.losses'))                                
-                #--------------------------------------------------------------------------------------
+                        torch.save(discriminator_losses, os.path.join(opt.output_dir, 'discriminator.losses'))
+                    #--------------------------------------------------------------------------------------
+
+                    if opt.save_interval > 0 and (discriminator.step + 1) % opt.save_interval  == 0: 
+                        if rank == 0:
+                            fid_evaluation.setup_evaluation(config['dataset']['class'], opt.output_dir + '_generated', path=opt.data_dir, target_size=config['global']['img_size'], num_real_images=8000)
+
+                            generator_file = os.path.join(opt.output_dir, 'generator.pth')
+                            generator.load_state_dict(torch.load(generator_file, map_location='cpu'))
+                            generator = generator.to('cuda')
+                            generator.eval()
+                            
+                            ema = torch.load(generator_file.replace('generator', 'ema'), map_location='cuda')
+                            parameters = [p for p in generator.parameters() if p.requires_grad]
+                            ema.copy_to(parameters)
+
+                            with torch.no_grad():
+                                generator.get_avg_w()
+                                for img_counter in tqdm(range(1000)):
+                                    z = torch.randn(1, 256, device='cuda')
+                                    with torch.no_grad():
+                                        img = generator(z, **config['camera'])[0]
+                                        save_image(img[0], os.path.join(opt.output_dir + '_generated', f'{img_counter:0>5}.png'), normalize=True, value_range=(-1, 1))
+
+                            fid = fid_evaluation.calculate_fid(config['dataset']['class'], opt.output_dir + '_generated', target_size=config['global']['img_size'])
+                            logger.add_scalar('fid', fid, discriminator.step)
+                            with open(os.path.join(opt.output_dir, f'fid.txt'), 'a') as f:
+                                f.write(f'\n{discriminator.step}:{fid}')

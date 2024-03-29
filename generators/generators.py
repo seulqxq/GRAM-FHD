@@ -115,8 +115,8 @@ class GramGenerator(Generator):
     def _volume(self, z, truncation_psi=1):
         return lambda points, ray_directions: self.representation.get_radiance(z, points, ray_directions, truncation_psi)
 
-    def _intersections(self, points, levels):
-        return self.representation.get_intersections(points, levels)
+    # def _intersections(self, points, levels):
+    #     return self.representation.get_intersections(points, levels)
 
     def get_avg_w(self):
         self.representation.get_avg_w()
@@ -128,7 +128,7 @@ class GramGenerator(Generator):
             camera_origin = torch.tensor(camera_origin, dtype=torch.float32, device=z.device).reshape(1, 3).expand(z.shape[0], 3)
         if img_size is None:
             img_size = self.img_size
-        img, _ = self.renderer.render(self._intersections, self._volume(z, truncation_psi), img_size, camera_origin, camera_pos, fov, ray_start, ray_end, z.device)
+        img, _ = self.renderer.render(self._volume(z, truncation_psi), img_size, camera_origin, camera_pos, fov, ray_start, ray_end, z.device)
         return img, camera_pos
 
   
@@ -207,5 +207,5 @@ class GramHDGenerator(Generator):
         if img_size is None:
             img_size = self.img_size
         frequencies, phase_shifts = self.representation.rf_network.mapping_network(z)
-        img, _ = self.renderer.render(self._intersections, self._volume(frequencies, phase_shifts, truncation_psi), self._feature(frequencies, phase_shifts, truncation_psi), self._super_resolution(z, truncation_psi), self.super_resolution_bg, img_size, camera_origin, camera_pos, fov, ray_start, ray_end, z.device)
+        img, _ = self.renderer.render(self._volume(frequencies, phase_shifts, truncation_psi), self._feature(frequencies, phase_shifts, truncation_psi), self._super_resolution(z, truncation_psi), self.super_resolution_bg, img_size, camera_origin, camera_pos, fov, ray_start, ray_end, z.device)
         return img, camera_pos
